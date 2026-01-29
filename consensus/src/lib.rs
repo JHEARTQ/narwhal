@@ -458,6 +458,12 @@ impl State {
     }
 }
 
+/// 共识主循环（Tusk）：从 Primary 接收 Certificate，构建 DAG，并在满足规则时输出提交顺序。
+///
+/// 设计要点：
+/// 1. **输入是因果有序的**：Primary 保证先发送祖先再发送后代。
+/// 2. **输出是全序的**：通过 Leader + DAG 展开（order_dag）生成确定顺序。
+/// 3. **回馈 Primary**：提交后反馈以触发 GC，形成闭环。
 pub struct Consensus {
     /// 委员会信息（包含验证者列表、权益权重等）
     committee: Committee,
@@ -480,6 +486,18 @@ pub struct Consensus {
 }
 
 impl Consensus {
+    /// 启动共识异步任务
+    ///
+    /// 为什么使用 tokio::spawn？
+    /// - 共识是一个长期运行的事件循环，不应阻塞调用方
+    /// - 通过异步任务隔离共识与网络 IO
+    ///
+    /// # 参数含义
+    /// - committee: 委员会成员与权益
+    /// - gc_depth: 垃圾回收深度（保留多少轮）
+    /// - rx_primary: Primary → Consensus 的输入流
+    /// - tx_primary: Consensus → Primary 的回馈流（用于清理）
+    /// - tx_output: Consensus → 执行层 的输出流
     pub fn spawn(
         committee: Committee,
         gc_depth: Round,
@@ -501,12 +519,20 @@ impl Consensus {
         });
     }
 
+    /// 共识主循环：不断吸收新证书，驱动 Leader 选举与提交
+    ///
+    /// 逻辑结构：
+    /// 1. 接收新 Certificate → 写入 DAG
+    /// 2. 基于轮次尝试 Leader 选举
+    /// 3. 判断 Leader 支持度（2f+1）
+    /// 4. 递归提交 Leader 链及其子 DAG
+    /// 5. 输出排序后的提交序列
     async fn run(&mut self) {
         // 初始化共识状态（仅在此处可变，其他部分不可变）
         // State 包含 DAG 的内存视图和提交进度
         let mut state = State::new(self.genesis.clone());
 
-        // 持续从 Primary 接收 Certificate
+        // 持续从 Primary 接收 Certificate（主输入流）
         while let Some(certificate) = self.rx_primary.recv().await {
             debug!("Processing {:?}", certificate);
             let round = certificate.round();

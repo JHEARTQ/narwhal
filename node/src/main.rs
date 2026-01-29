@@ -66,6 +66,12 @@ async fn main() -> Result<()> {
 }
 
 // Runs either a worker or a primary.
+/// 运行节点的主逻辑（Worker 或 Primary）
+///
+/// # 架构概览
+/// Narwhal 节点可以是：
+/// - **Primary**: 维护 Mempool 协议头（Header）和共识（Consensus）。
+/// - **Worker**: 负责交易数据的存储和广播。
 async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     let key_file = matches.value_of("keys").unwrap();
     let committee_file = matches.value_of("committee").unwrap();
@@ -73,6 +79,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     let store_path = matches.value_of("store").unwrap();
 
     // Read the committee and node's keypair from file.
+    // 读取密钥对和委员会配置
     let keypair = KeyPair::import(key_file).context("Failed to load the node's keypair")?;
     let committee =
         Committee::import(committee_file).context("Failed to load the committee information")?;
@@ -86,17 +93,30 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     };
 
     // Make the data store.
+    // 初始化持久化存储（RocksDB）
     let store = Store::new(store_path).context("Failed to create a store")?;
 
     // Channels the sequence of certificates.
+    // 共识输出通道：Consensus -> Client/Application
+    // 经过共识排序后的 Certificate 会被发送到这里
     let (tx_output, rx_output) = channel(CHANNEL_CAPACITY);
 
     // Check whether to run a primary, a worker, or an entire authority.
     match matches.subcommand() {
         // Spawn the primary and consensus core.
+        // 启动 Primary 节点（包含 Primary 核心和 Consensus 模块）
         ("primary", _) => {
+            // Channel 1: Primary -> Consensus
+            // Primary 将收集齐 2f+1 签名的完整 Certificate 发送给 Consensus
             let (tx_new_certificates, rx_new_certificates) = channel(CHANNEL_CAPACITY);
+
+            // Channel 2: Consensus -> Primary
+            // Consensus 将已经排序（Commit）的 Certificate 发回 Primary
+            // 用途：Primary 收到后可以进行垃圾回收（GC），清理过旧的历史数据
             let (tx_feedback, rx_feedback) = channel(CHANNEL_CAPACITY);
+
+            // 1. 启动 Primary 模块
+            // 职责：广播 Header，收集 Vote，生成 Certificate，构建 DAG
             Primary::spawn(
                 keypair,
                 committee.clone(),
@@ -105,6 +125,9 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                 /* tx_consensus */ tx_new_certificates,
                 /* rx_consensus */ rx_feedback,
             );
+
+            // 2. 启动 Consensus 模块
+            // 职责：接收 Certificate，运行 Tusk 算法选 Leader，输出确定的提交顺序
             Consensus::spawn(
                 committee,
                 parameters.gc_depth,
@@ -115,6 +138,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
         }
 
         // Spawn a single worker.
+        // 启动 Worker 节点
         ("worker", Some(sub_matches)) => {
             let id = sub_matches
                 .value_of("id")
@@ -127,15 +151,24 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     }
 
     // Analyze the consensus' output.
+    // 将共识输出流传递给分析函数（应用层）
     analyze(rx_output).await;
 
     // If this expression is reached, the program ends and all other tasks terminate.
     unreachable!();
 }
 
-/// Receives an ordered list of certificates and apply any application-specific logic.
+/// 处理共识输出流
+///
+/// 当共识模块确定了 Certificate 的线性顺序后，会通过 channel 发送到这里。
+/// 这是连接"共识层"与"执行层/应用层"的接口。
 async fn analyze(mut rx_output: Receiver<Certificate>) {
     while let Some(_certificate) = rx_output.recv().await {
         // NOTE: Here goes the application logic.
+        // 这里实现具体的业务逻辑。
+        // 例如：
+        // 1. 解析 certificate 中的 payload (Batches)
+        // 2. 从 Worker 获取实际交易数据
+        // 3. 按顺序执行交易
     }
 }
